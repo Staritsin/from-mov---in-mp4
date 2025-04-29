@@ -65,11 +65,13 @@ def get_result(task_id):
 
     # Вернуть статус
     if os.path.exists(output_path):
+ 
         return jsonify({
             "status": "done",
-            "url": f"/result/{task_id}?raw=true",
-            "fileSize": os.path.getsize(output_path)
+            "fileSize": os.path.getsize(output_path) // 1024,
+            "url": f"https://from-mov-in-mp4.onrender.com/result/{task_id}?raw=true"
         })
+    
     else:
         return jsonify({"status": status})
 
