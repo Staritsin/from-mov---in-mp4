@@ -16,15 +16,21 @@ def convert_video(task_id, input_url):
     input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.input")
     output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
 
-    subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
+    try:
+        # Скачиваем видео
+        subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
 
-    subprocess.run([
-        "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path
-    ], check=True)
+        # Конвертируем в mp4 с правильной упаковкой
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-c:v", "libx264", "-preset", "fast",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ], check=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"Ошибка обработки видео: {e}")
 
 @app.route("/convert", methods=["POST"])
 def start_conversion():
