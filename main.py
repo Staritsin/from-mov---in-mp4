@@ -46,7 +46,14 @@ def get_result(task_id):
         return jsonify({"status": "processing"})
 
     if request.args.get("raw") == "true":
-        return send_from_directory(OUTPUT_FOLDER, f"{task_id}.mp4")
+    
+    from flask import send_file
+
+        return send_file(
+            os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4"),
+            mimetype="video/mp4",
+            as_attachment=True
+        )
 
     return jsonify({
         "status": "done",
