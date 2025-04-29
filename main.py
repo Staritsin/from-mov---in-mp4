@@ -41,9 +41,18 @@ def start_conversion():
 @app.route("/result/<task_id>", methods=["GET"])
 def get_result(task_id):
     output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+
     if not os.path.exists(output_path):
         return jsonify({"status": "processing"})
-    return send_file(output_path, mimetype="video/mp4")
+
+    if request.args.get("raw") == "true":
+        return send_from_directory(OUTPUT_FOLDER, f"{task_id}.mp4")
+
+    return jsonify({
+        "status": "done",
+        "url": f"/result/{task_id}?raw=true"
+    })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))  # <-- Ключевая правка
