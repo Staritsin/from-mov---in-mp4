@@ -49,10 +49,11 @@ def get_result(task_id):
     if request.args.get("raw") == "true":
         return send_file(output_path, mimetype="video/mp4", as_attachment=False)
 
-    return jsonify({
-        "status": "done",
-        "url": f"/result/{task_id}?raw=true"
-    })
+        return jsonify({
+            "status": "done",
+            "url": f"https://from-mov-in-mp4.onrender.com/result/{task_id}?raw=true"
+        })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
