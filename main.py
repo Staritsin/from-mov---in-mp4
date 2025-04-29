@@ -16,10 +16,10 @@ def convert_video(task_id, input_url):
     input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.input")
     output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
 
-    # Скачиваем файл
+    # Скачиваем видео
     subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
 
-    # Конвертируем в MP4
+    # Конвертируем в mp4
     subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264", "-preset", "fast",
@@ -35,7 +35,6 @@ def start_conversion():
 
     task_id = str(uuid.uuid4())
     threading.Thread(target=convert_video, args=(task_id, input_url)).start()
-
     return jsonify({"status": "started", "task_id": task_id})
 
 @app.route("/result/<task_id>", methods=["GET"])
@@ -45,22 +44,20 @@ def get_result(task_id):
     if not os.path.exists(output_path):
         return jsonify({"status": "processing"})
 
+    # Если запрашивают видео напрямую
     if request.args.get("raw") == "true":
-    
-    from flask import send_file
-
         return send_file(
-            os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4"),
+            output_path,
             mimetype="video/mp4",
-            as_attachment=True
+            as_attachment=False
         )
 
+    # Если просто хотим узнать статус и получить ссылку
     return jsonify({
         "status": "done",
         "url": f"/result/{task_id}?raw=true"
     })
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))  # <-- Ключевая правка
+    port = int(os.environ.get("PORT", 10000))
     app.run(debug=False, host="0.0.0.0", port=port)
