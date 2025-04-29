@@ -16,15 +16,15 @@ def convert_video(task_id, input_url):
     input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.input")
     output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
 
-    # Скачиваем видео по ссылке
+    # Скачиваем видео
     subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
 
-    # Конвертируем в mp4 с флагом faststart
+    # Конвертируем в mp4
     subprocess.run([
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx264", "-preset", "fast",
         "-c:a", "aac",
-        "-movflags", "+faststart",
+        "-movflags", "+faststart",  # важно для Telegram
         output_path
     ], check=True)
 
@@ -46,14 +46,15 @@ def get_result(task_id):
     if not os.path.exists(output_path):
         return jsonify({"status": "processing"})
 
+    # Если нужно видеофайл напрямую
     if request.args.get("raw") == "true":
         return send_file(output_path, mimetype="video/mp4", as_attachment=False)
 
-        return jsonify({
-            "status": "done",
-            "url": f"https://from-mov-in-mp4.onrender.com/result/{task_id}?raw=true"
-        })
-
+    # Если просто проверяем статус
+    return jsonify({
+        "status": "done",
+        "url": f"https://from-mov-in-mp4.onrender.com/result/{task_id}?raw=true"
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
