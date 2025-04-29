@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 import os
 import uuid
-import threading
 import subprocess
 
 app = Flask(__name__)
@@ -11,20 +10,31 @@ OUTPUT_FOLDER = "converted"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
+# Кэш задач
+task_status = {}
+
 def convert_video(task_id, input_url):
-    input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.input")
-    output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+    try:
+        input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.mov")
+        output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+        task_status[task_id] = "processing"
 
-    # Скачивание видео
-    subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
+        # Скачиваем файл
+        subprocess.run(["curl", "-L", input_url, "-o", input_path], check=True)
 
-    # Конвертация в .mp4 с faststart
-    subprocess.run([
-        "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "fast",
-        "-c:a", "aac", "-movflags", "+faststart",
-        output_path
-    ], check=True)
+        # Конвертация
+        subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-c:v", "libx264", "-preset", "fast",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            output_path
+        ], check=True)
+
+        task_status[task_id] = "done"
+
+    except Exception as e:
+        task_status[task_id] = "error"
 
 @app.route("/convert", methods=["POST"])
 def start_conversion():
@@ -34,26 +44,34 @@ def start_conversion():
         return jsonify({"error": "Missing URL"}), 400
 
     task_id = str(uuid.uuid4())
-    thread = threading.Thread(target=convert_video, args=(task_id, input_url))
-    thread.start()
+    task_status[task_id] = "queued"
+
+    from threading import Thread
+    Thread(target=convert_video, args=(task_id, input_url)).start()
 
     return jsonify({"status": "started", "task_id": task_id})
 
 @app.route("/result/<task_id>", methods=["GET"])
 def get_result(task_id):
     output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+    status = task_status.get(task_id, "processing")
 
-    if not os.path.exists(output_path):
-        return jsonify({"status": "processing"})
-
-    # Отдаём либо файл напрямую, либо JSON со ссылкой
+    # Вернуть готовый mp4
     if request.args.get("raw") == "true":
-        return send_file(output_path, mimetype="video/mp4", as_attachment=False)
+        if os.path.exists(output_path):
+            return send_file(output_path, mimetype="video/mp4", as_attachment=False)
+        else:
+            return "File not ready", 404
 
-    return jsonify({
-        "status": "done",
-        "url": f"https://from-mov-in-mp4.onrender.com/result/{task_id}?raw=true"
-    })
+    # Вернуть статус
+    if os.path.exists(output_path):
+        return jsonify({
+            "status": "done",
+            "url": f"/result/{task_id}?raw=true",
+            "fileSize": os.path.getsize(output_path)
+        })
+    else:
+        return jsonify({"status": status})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
