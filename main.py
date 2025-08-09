@@ -92,7 +92,7 @@ def convert_downscale(src: str, dst: str, max_width: int, target_mb: int,
     ])
 
 def make_url(task_id: str, base_url: str) -> str:
-    return f"{base_url}/result/{task_id}?raw=true"
+    return f"{base_url}/file/{task_id}.mp4"
 
 def handle_pipeline(src_url: str, mode: str, target_mb: int, max_width: int,
                     audio_kbps: int, base_url: str, task_id: str | None = None) -> dict:
@@ -193,6 +193,18 @@ def enqueue():
         "task_id": task_id,
         "result": f"{base_url}/result/{task_id}"
     }), 202
+
+@app.route("/file/<task_id>.mp4", methods=["GET", "HEAD"])
+def file_direct(task_id):
+    path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+    if not os.path.exists(path):
+        return "Not ready", 404
+    return send_file(
+        path,
+        mimetype="video/mp4",
+        as_attachment=False,
+        download_name=f"{task_id}.mp4"
+    )
 
 @app.get("/result/<task_id>")
 def get_result(task_id):
