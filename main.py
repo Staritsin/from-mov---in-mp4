@@ -1,14 +1,11 @@
 from flask import Flask, request, jsonify, send_file
-import os
-import uuid
-import subprocess
-import requests
+import os, uuid, subprocess, requests, math
 
 app = Flask(__name__)
 
+# Эфемерные каталоги (Render Free)
 UPLOAD_FOLDER = "/tmp/downloads"
 OUTPUT_FOLDER = "/tmp/converted"
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -18,68 +15,158 @@ def health():
 
 def abs_base_url():
     proto = request.headers.get("X-Forwarded-Proto", "https")
-    host = request.host
-    return f"{proto}://{host}"
+    return f"{proto}://{request.host}"
 
 def download_to(path: str, url: str):
-    with requests.get(url, stream=True, timeout=60) as r:
+    with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
-def convert_video_file(input_path: str, output_path: str):
+def probe_duration_sec(path: str) -> float:
+    # Получаем длительность через ffprobe
     cmd = [
-        "ffmpeg", "-y", "-i", input_path,
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", path
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    try:
+        return float(out)
+    except Exception:
+        return 0.0
+
+def convert_copy(src: str, dst: str):
+    cmd = [
+        "ffmpeg","-y","-i",src,
+        "-c:v","libx264","-preset","veryfast","-pix_fmt","yuv420p",
+        "-c:a","aac","-movflags","+faststart",
+        dst
     ]
     subprocess.check_call(cmd)
 
-@app.post("/convert")
-def start_conversion():
+def convert_downscale(src: str, dst: str, max_width: int, target_mb: int,
+                      audio_kbps: int = 96, floor_video_kbps: int = 300):
     """
-    JSON: {"url": "https://..."}  ->  {"status":"started","task_id":"..."}
-    Результат см. GET /result/<task_id>
+    Гарантированно ужимаем в ~target_mb, сохраняя пропорции, уменьшая ширину до max_width.
+    Алгоритм: считаем цель по общему битрейту из длительности и выставляем CBR-параметры.
     """
-    data = request.get_json(silent=True) or {}
-    input_url = data.get("url")
-    if not input_url or not input_url.startswith("http"):
-        return jsonify({"error": "Missing or invalid url"}), 400
+    dur = probe_duration_sec(src)
+    if dur <= 0:
+        # Если не удалось получить длительность — используем CRF как запасной вариант
+        cmd = [
+            "ffmpeg","-y","-i",src,
+            "-vf", f"scale='if(gt(iw,{max_width}),{max_width},iw)':'-2'",
+            "-c:v","libx264","-preset","veryfast","-crf","28","-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a",f"{audio_kbps}k",
+            "-movflags","+faststart", dst
+        ]
+        subprocess.check_call(cmd)
+        return
 
+    # Целевой общий битрейт (кбит/с): размер (МБ) -> Мбит -> кбит / сек
+    total_kbps = max(1, math.floor((target_mb * 8192) / dur))
+    video_kbps = max(floor_video_kbps, total_kbps - audio_kbps)
+
+    # Делаем ограничение по пикселям + CBR-параметры
+    cmd = [
+        "ffmpeg","-y","-i",src,
+        "-vf", f"scale='if(gt(iw,{max_width}),{max_width},iw)':'-2'",
+        "-c:v","libx264","-preset","veryfast","-b:v",f"{video_kbps}k",
+        "-maxrate",f"{video_kbps}k","-bufsize",f"{video_kbps*2}k",
+        "-pix_fmt","yuv420p",
+        "-c:a","aac","-b:a",f"{audio_kbps}k",
+        "-movflags","+faststart", dst
+    ]
+    subprocess.check_call(cmd)
+
+def make_url(task_id: str) -> str:
+    return f"{abs_base_url()}/result/{task_id}?raw=true"
+
+def handle_pipeline(src_url: str, mode: str, target_mb: int, max_width: int, audio_kbps: int):
     task_id = str(uuid.uuid4())
-    input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.src")
-    output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+    src = os.path.join(UPLOAD_FOLDER, f"{task_id}.src")
+    dst = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+
+    download_to(src, src_url)
+
+    # Выбираем стратегию
+    if mode == "copy":
+        convert_copy(src, dst)
+    elif mode == "downscale":
+        convert_downscale(src, dst, max_width=max_width, target_mb=target_mb, audio_kbps=audio_kbps)
+    else:  # auto/smart
+        # Если файл > ~20MB — ужимаем; иначе просто конвертим
+        size_mb = max(1, os.path.getsize(src) // (1024 * 1024))
+        if size_mb > 20:
+            convert_downscale(src, dst, max_width=max_width, target_mb=target_mb, audio_kbps=audio_kbps)
+        else:
+            convert_copy(src, dst)
 
     try:
-        download_to(input_path, input_url)
-        convert_video_file(input_path, output_path)
-    finally:
-        try:
-            os.remove(input_path)
-        except Exception:
-            pass
+        os.remove(src)
+    except Exception:
+        pass
 
-    # Можно вернуть сразу готовый URL (без опроса)
-    mp4_url = f"{abs_base_url()}/result/{task_id}?raw=true"
-    return jsonify({"status": "done", "task_id": task_id, "mp4_url": mp4_url}), 200
+    return {"status": "done", "task_id": task_id, "mp4_url": make_url(task_id)}
+
+@app.post("/convert")
+def convert_endpoint():
+    """
+    Простая конвертация в MP4 (без ограничения размера).
+    JSON: {"url": "https://..."}
+    """
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    if not url or not url.startswith("http"):
+        return jsonify({"error": "Missing or invalid url"}), 400
+    res = handle_pipeline(url, mode="copy", target_mb=19, max_width=720, audio_kbps=96)
+    return jsonify(res), 200
+
+@app.post("/downscale")
+def downscale_endpoint():
+    """
+    Принудительное ужатие под лимит.
+    JSON: {"url":"https://...", "target_mb":19, "max_width":720, "audio_kbps":96}
+    """
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    target_mb = int(data.get("target_mb", 19))
+    max_width = int(data.get("max_width", 720))
+    audio_kbps = int(data.get("audio_kbps", 96))
+    if not url or not url.startswith("http"):
+        return jsonify({"error": "Missing or invalid url"}), 400
+    res = handle_pipeline(url, mode="downscale", target_mb=target_mb,
+                          max_width=max_width, audio_kbps=audio_kbps)
+    return jsonify(res), 200
+
+@app.post("/smart")
+def smart_endpoint():
+    """
+    Автовыбор: если файл большой — ужимаем; если маленький — просто конвертим.
+    JSON: {"url":"https://...", "target_mb":19, "max_width":720, "audio_kbps":96}
+    """
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    target_mb = int(data.get("target_mb", 19))
+    max_width = int(data.get("max_width", 720))
+    audio_kbps = int(data.get("audio_kbps", 96))
+    if not url or not url.startswith("http"):
+        return jsonify({"error": "Missing or invalid url"}), 400
+    res = handle_pipeline(url, mode="auto", target_mb=target_mb,
+                          max_width=max_width, audio_kbps=audio_kbps)
+    return jsonify(res), 200
 
 @app.get("/result/<task_id>")
 def get_result(task_id):
-    output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
-    if not os.path.exists(output_path):
+    dst = os.path.join(OUTPUT_FOLDER, f"{task_id}.mp4")
+    if not os.path.exists(dst):
         return jsonify({"status": "processing"}), 200
-
     if request.args.get("raw") == "true":
-        return send_file(output_path, mimetype="video/mp4", as_attachment=False)
-
-    mp4_url = f"{abs_base_url()}/result/{task_id}?raw=true"
-    size_kb = os.path.getsize(output_path) // 1024
-    return jsonify({"status": "done", "fileSizeKB": size_kb, "mp4_url": mp4_url}), 200
+        return send_file(dst, mimetype="video/mp4", as_attachment=False)
+    size_kb = os.path.getsize(dst) // 1024
+    return jsonify({"status":"done","fileSizeKB":size_kb,"mp4_url":make_url(task_id)}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
