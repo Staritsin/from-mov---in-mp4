@@ -174,5 +174,61 @@ def get_file(task_id):
 def health():
     return "ok", 200
 
+import threading
+
+def process_in_background(url, mode, crf, target_mb, audio_kbps, aspect_mode, task_id):
+    src = os.path.join(UPLOAD_DIR, f"{task_id}.src")
+    dst = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
+    vf = _vf_9x16_crop() if aspect_mode == "crop" else _vf_9x16_pad()
+    try:
+        _download(url, src)
+        _encode_ffmpeg(src, dst, vf=vf, mode=mode, crf=crf, target_mb=target_mb, audio_kbps=audio_kbps)
+    finally:
+        if os.path.exists(src):
+            os.remove(src)
+
+@app.post("/enqueue")
+def enqueue():
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    if not url or not str(url).startswith("http"):
+        return jsonify({"error": "Missing or invalid 'url'"}), 400
+
+    mode = (data.get("mode") or "crf").lower()
+    crf = int(data.get("crf", 23))
+    target_mb = int(data.get("target_mb", 19))
+    audio_kbps = int(data.get("audio_kbps", 96))
+    aspect_mode = (data.get("aspect_mode") or "crop").lower()
+
+    task_id = str(uuid.uuid4())
+
+    threading.Thread(
+        target=process_in_background,
+        args=(url, mode, crf, target_mb, audio_kbps, aspect_mode, task_id),
+        daemon=True
+    ).start()
+
+    base = f"{request.scheme}://{request.host}"
+    return jsonify({
+        "status": "queued",
+        "task_id": task_id,
+        "result_url": f"{base}/file/{task_id}.mp4",
+        "status_url": f"{base}/result/{task_id}"
+    }), 202
+
+@app.get("/result/<task_id>")
+def result(task_id):
+    dst = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
+    if not os.path.exists(dst):
+        return jsonify({"status": "processing"}), 200
+    size_mb = os.path.getsize(dst) / (1024 * 1024)
+    base = f"{request.scheme}://{request.host}"
+    return jsonify({
+        "status": "done",
+        "result_mb": round(size_mb, 2),
+        "mp4_url": f"{base}/file/{task_id}.mp4"
+    }), 200
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+
