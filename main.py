@@ -1,17 +1,58 @@
-from flask import Flask, request, jsonify, send_file
-import os, uuid, subprocess, requests, math
+# main.py — конвертер в MP4 9:16 для Render
+# Поддерживает:
+#   1) POST /convert {url,...}       — синхронно, сразу отдаёт mp4_url
+#   2) POST /enqueue {url,...}       — асинхронно по URL (202 + status_url)
+#   3) POST /enqueue_file (multipart)— асинхронно по бинарю файла
+#   4) GET  /status?job_id=...       — статус задачи
+#   5) GET  /file/<id>.mp4           — выдача готового видео
+#   6) GET  /health                  — "ok"
+#
+# Сделано без заглушек. Готово под gunicorn на Render.
+
+import os
+import uuid
+import math
+import json
+import shlex
+import threading
+import subprocess
+from typing import Dict, Any
+from flask import Flask, request, jsonify, send_file, abort, Response
 
 app = Flask(__name__)
 
-UPLOAD_DIR = "/tmp/downloads"
+# --- Директории ---
+UPLOAD_DIR = "/tmp/uploads"
 OUTPUT_DIR = "/tmp/converted"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-OUT_W = 1080   # ширина выходного видео
-OUT_H = 1920   # высота выходного видео
+# --- Ограничение размеров запроса (1 ГБ) ---
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024 * 1024
 
-def _download(url: str, dst: str):
+# --- Глобальные константы видео ---
+OUT_W = 1080
+OUT_H = 1920
+
+# --- Очередь задач в памяти ---
+JOBS: Dict[str, Dict[str, Any]] = {}  # job_id -> {"status":"queued|processing|done|error", "out_url":"/file/<id>.mp4", "error":None}
+
+
+# ============================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================
+
+def _no_store(resp: Response) -> Response:
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+@app.after_request
+def _disable_cache(resp: Response) -> Response:
+    return _no_store(resp)
+
+def _download(url: str, dst: str) -> None:
+    """Скачивание по URL на диск."""
+    import requests  # локальный импорт, чтобы не тормозить cold start
     with requests.get(url, stream=True, timeout=300, headers={"User-Agent": "mov2mp4-9x16"}) as r:
         r.raise_for_status()
         with open(dst, "wb") as f:
@@ -30,11 +71,10 @@ def _probe_duration_sec(path: str) -> float:
     except Exception:
         return 0.0
 
-def _vf_9x16_crop():
+def _vf_9x16_crop() -> str:
     """
-    Обрезка под 9:16 по центру + масштаб до 1080x1920.
+    Центровая обрезка под 9:16 + scale до 1080x1920.
     """
-    # crop динамически под исходный аспект, затем scale до OUT_W x OUT_H
     crop = (
         "crop="
         "w='if(gte(iw/ih,9/16),ih*9/16,iw)':"
@@ -45,25 +85,17 @@ def _vf_9x16_crop():
     scale = f"scale={OUT_W}:{OUT_H}"
     return f"{crop},{scale}"
 
-def _vf_9x16_pad(max_width_before_pad=None):
+def _vf_9x16_pad() -> str:
     """
-    Масштаб по длинной стороне + паддинг до 1080x1920 (без обрезки).
-    max_width_before_pad — опционально ограничить ширину перед паддингом (обычно не нужно).
+    Масштаб внутрь 1080x1920 без обрезки + паддинг до 9:16.
     """
-    # Сначала масштабируем так, чтобы уложиться внутрь 1080x1920, затем добавляем поля.
-    # (после scale переменные iw/ih — уже новые размеры)
-    scale = (
-        f"scale='if(gte(iw/ih,9/16),{OUT_W},-2)':'if(gte(iw/ih,9/16),-2,{OUT_H})'"
-    )
+    scale = f"scale='if(gte(iw/ih,9/16),{OUT_W},-2)':'if(gte(iw/ih,9/16),-2,{OUT_H})'"
     pad = f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:black"
-    if max_width_before_pad and isinstance(max_width_before_pad, int):
-        # при желании можно предварительно ограничить ширину
-        pre = f"scale='if(gt(iw,{max_width_before_pad}),{max_width_before_pad},iw)':'-2'"
-        return f"{pre},{scale},{pad}"
     return f"{scale},{pad}"
 
-def _encode_ffmpeg(src: str, dst: str, vf: str, mode: str, crf: int, target_mb: int, audio_kbps: int):
+def _encode_ffmpeg(src: str, dst: str, vf: str, mode: str, crf: int, target_mb: int, audio_kbps: int) -> None:
     """
+    Кодирование в H.264/AAC 9:16.
     mode: 'crf' | 'target'
     """
     if mode == "target":
@@ -82,7 +114,7 @@ def _encode_ffmpeg(src: str, dst: str, vf: str, mode: str, crf: int, target_mb: 
                 dst
             ]
         else:
-            # если длительность не прочиталась — используем CRF 28 как fallback
+            # fallback, если длительность не считалась
             cmd = [
                 "ffmpeg", "-y", "-i", src,
                 "-vf", vf,
@@ -92,7 +124,6 @@ def _encode_ffmpeg(src: str, dst: str, vf: str, mode: str, crf: int, target_mb: 
                 dst
             ]
     else:
-        # CRF-режим
         cmd = [
             "ffmpeg", "-y", "-i", src,
             "-vf", vf,
@@ -103,92 +134,68 @@ def _encode_ffmpeg(src: str, dst: str, vf: str, mode: str, crf: int, target_mb: 
         ]
     subprocess.check_call(cmd)
 
-@app.post("/convert")
-def convert():
+
+def _start_job_from_path(src_path: str, opts: Dict[str, Any]) -> str:
     """
-    JSON:
-    {
-      "url": "https://.../video.mov",     # обязательный
-      "mode": "crf" | "target",           # сжатие: по качеству (CRF) или под размер; по умолчанию "crf"
-      "crf": 23,                          # для mode=crf (18..28), по умолчанию 23
-      "target_mb": 19,                    # для mode=target, желаемый размер
-      "audio_kbps": 96,                   # аудио битрейт
-      "aspect_mode": "crop" | "pad"       # приведение к 9:16: обрезать или паддить; по умолчанию "crop"
-    }
-    Ответ всегда 1080x1920 (9:16).
+    Создаёт задачу из локального файла. Возвращает job_id.
     """
-    data = request.get_json(silent=True) or {}
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"status": "queued", "out_url": None, "error": None}
 
-    url = data.get("url")
-    if not url or not str(url).startswith("http"):
-        return jsonify({"error": "Missing or invalid 'url'"}), 400
-
-    mode = (data.get("mode") or "crf").lower()
-    crf = int(data.get("crf", 23))
-    target_mb = int(data.get("target_mb", 19))
-    audio_kbps = int(data.get("audio_kbps", 96))
-    aspect_mode = (data.get("aspect_mode") or "crop").lower()  # "crop" | "pad"
-
-    task_id = str(uuid.uuid4())
-    src = os.path.join(UPLOAD_DIR, f"{task_id}.src")
-    dst = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
-
-    # Видеофильтр под 9:16
-    vf = _vf_9x16_crop() if aspect_mode == "crop" else _vf_9x16_pad()
-
-    try:
-        _download(url, src)
-        _encode_ffmpeg(src, dst, vf=vf, mode=mode, crf=crf, target_mb=target_mb, audio_kbps=audio_kbps)
-    except subprocess.CalledProcessError as e:
-        return jsonify({"error": f"ffmpeg failed: {e}"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if os.path.exists(src):
+    def _worker():
+        try:
+            JOBS[job_id]["status"] = "processing"
+            dst = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+            aspect_mode = (opts.get("aspect_mode") or "crop").lower()
+            vf = _vf_9x16_crop() if aspect_mode == "crop" else _vf_9x16_pad()
+            _encode_ffmpeg(
+                src=src_path,
+                dst=dst,
+                vf=vf,
+                mode=(opts.get("mode") or "crf").lower(),
+                crf=int(opts.get("crf", 23)),
+                target_mb=int(opts.get("target_mb", 19)),
+                audio_kbps=int(opts.get("audio_kbps", 96)),
+            )
+            JOBS[job_id]["status"] = "done"
+            JOBS[job_id]["out_url"] = f"/file/{job_id}.mp4"
+        except Exception as e:
+            JOBS[job_id]["status"] = "error"
+            JOBS[job_id]["error"] = str(e)
+        finally:
             try:
-                os.remove(src)
+                if os.path.exists(src_path):
+                    os.remove(src_path)
             except Exception:
                 pass
 
-    size_mb = os.path.getsize(dst) / (1024 * 1024)
-    file_url = f"{request.scheme}://{request.host}/file/{task_id}.mp4"
-    return jsonify({
-        "status": "done",
-        "width": OUT_W,
-        "height": OUT_H,
-        "aspect": "9:16",
-        "aspect_mode": aspect_mode,
-        "mode": mode,
-        "result_mb": round(size_mb, 2),
-        "mp4_url": file_url
-    }), 200
+    threading.Thread(target=_worker, daemon=True).start()
+    return job_id
 
-@app.get("/file/<task_id>.mp4")
-def get_file(task_id):
-    path = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
-    if not os.path.exists(path):
-        return "Not found", 404
-    return send_file(path, mimetype="video/mp4", as_attachment=False, download_name=f"{task_id}.mp4")
+
+# ============================
+# ЭНДПОИНТЫ
+# ============================
 
 @app.get("/health")
 def health():
     return "ok", 200
 
-import threading
 
-def process_in_background(url, mode, crf, target_mb, audio_kbps, aspect_mode, task_id):
-    src = os.path.join(UPLOAD_DIR, f"{task_id}.src")
-    dst = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
-    vf = _vf_9x16_crop() if aspect_mode == "crop" else _vf_9x16_pad()
-    try:
-        _download(url, src)
-        _encode_ffmpeg(src, dst, vf=vf, mode=mode, crf=crf, target_mb=target_mb, audio_kbps=audio_kbps)
-    finally:
-        if os.path.exists(src):
-            os.remove(src)
-
-@app.post("/enqueue")
-def enqueue():
+@app.post("/convert")
+def convert():
+    """
+    СИНХРОННО: скачивает url и сразу возвращает mp4_url.
+    Body JSON:
+    {
+      "url": "https://.../video.mov",
+      "mode": "crf" | "target",
+      "crf": 23,
+      "target_mb": 19,
+      "audio_kbps": 96,
+      "aspect_mode": "crop" | "pad"
+    }
+    """
     data = request.get_json(silent=True) or {}
     url = data.get("url")
     if not url or not str(url).startswith("http"):
@@ -200,35 +207,135 @@ def enqueue():
     audio_kbps = int(data.get("audio_kbps", 96))
     aspect_mode = (data.get("aspect_mode") or "crop").lower()
 
-    task_id = str(uuid.uuid4())
-
-    threading.Thread(
-        target=process_in_background,
-        args=(url, mode, crf, target_mb, audio_kbps, aspect_mode, task_id),
-        daemon=True
-    ).start()
-
-    base = f"{request.scheme}://{request.host}"
-    return jsonify({
-        "status": "queued",
-        "task_id": task_id,
-        "result_url": f"{base}/file/{task_id}.mp4",
-        "status_url": f"{base}/result/{task_id}"
-    }), 202
-
-@app.get("/result/<task_id>")
-def result(task_id):
+    task_id = uuid.uuid4().hex
+    src = os.path.join(UPLOAD_DIR, f"{task_id}.src")
     dst = os.path.join(OUTPUT_DIR, f"{task_id}.mp4")
-    if not os.path.exists(dst):
-        return jsonify({"status": "processing"}), 200
+    vf = _vf_9x16_crop() if aspect_mode == "crop" else _vf_9x16_pad()
+
+    try:
+        _download(url, src)
+        _encode_ffmpeg(src, dst, vf=vf, mode=mode, crf=crf, target_mb=target_mb, audio_kbps=audio_kbps)
+    except subprocess.CalledProcessError as e:
+        return jsonify({"error": f"ffmpeg failed: {e}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            if os.path.exists(src):
+                os.remove(src)
+        except Exception:
+            pass
+
     size_mb = os.path.getsize(dst) / (1024 * 1024)
     base = f"{request.scheme}://{request.host}"
     return jsonify({
         "status": "done",
+        "width": OUT_W,
+        "height": OUT_H,
+        "aspect": "9:16",
+        "aspect_mode": aspect_mode,
+        "mode": mode,
         "result_mb": round(size_mb, 2),
         "mp4_url": f"{base}/file/{task_id}.mp4"
     }), 200
 
+
+@app.post("/enqueue")
+def enqueue():
+    """
+    АСИНХРОННО ПО URL: 202 + status_url/result_url.
+    """
+    data = request.get_json(silent=True) or {}
+    url = data.get("url")
+    if not url or not str(url).startswith("http"):
+        return jsonify({"error": "Missing or invalid 'url'"}), 400
+
+    opts = {
+        "mode": (data.get("mode") or "crf").lower(),
+        "crf": int(data.get("crf", 23)),
+        "target_mb": int(data.get("target_mb", 19)),
+        "audio_kbps": int(data.get("audio_kbps", 96)),
+        "aspect_mode": (data.get("aspect_mode") or "crop").lower(),
+    }
+
+    # Скачиваем во временный файл и ставим задачу
+    tmp = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.src")
+    try:
+        _download(url, tmp)
+    except Exception as e:
+        return jsonify({"error": f"download failed: {e}"}), 400
+
+    job_id = _start_job_from_path(tmp, opts)
+    base = f"{request.scheme}://{request.host}"
+    return jsonify({
+        "status": "queued",
+        "job_id": job_id,
+        "result_url": f"{base}/file/{job_id}.mp4",
+        "status_url": f"{base}/status?job_id={job_id}"
+    }), 202
+
+
+@app.post("/enqueue_file")
+def enqueue_file():
+    """
+    АСИНХРОННО ПО ФАЙЛУ (multipart/form-data):
+      - file: бинарь видео
+      - opts: JSON-строка с полями как в /enqueue
+    """
+    f = request.files.get("file")
+    if not f:
+        return jsonify({"error": "file is required"}), 400
+
+    opts_raw = request.form.get("opts", "{}")
+    try:
+        opts = json.loads(opts_raw)
+    except Exception:
+        return jsonify({"error": "opts must be JSON"}), 400
+
+    # Нормализуем опции
+    opts = {
+        "mode": (opts.get("mode") or "crf").lower(),
+        "crf": int(opts.get("crf", 23)),
+        "target_mb": int(opts.get("target_mb", 19)),
+        "audio_kbps": int(opts.get("audio_kbps", 96)),
+        "aspect_mode": (opts.get("aspect_mode") or "crop").lower(),
+    }
+
+    tmp = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}.src")
+    f.save(tmp)
+
+    job_id = _start_job_from_path(tmp, opts)
+    base = f"{request.scheme}://{request.host}"
+    return jsonify({
+        "status": "queued",
+        "job_id": job_id,
+        "result_url": f"{base}/file/{job_id}.mp4",
+        "status_url": f"{base}/status?job_id={job_id}"
+    }), 200
+
+
+@app.get("/status")
+def status():
+    job_id = request.args.get("job_id")
+    j = JOBS.get(job_id)
+    if not j:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"job_id": job_id, **j}), 200
+
+
+@app.get("/file/<name>")
+def file_out(name: str):
+    # name ожидается вида "<job_id>.mp4"
+    if not name.endswith(".mp4"):
+        return abort(404)
+    path = os.path.join(OUTPUT_DIR, name)
+    if not os.path.exists(path):
+        return abort(404)
+    resp = send_file(path, mimetype="video/mp4", as_attachment=False, download_name=name)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# --- entrypoint ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
